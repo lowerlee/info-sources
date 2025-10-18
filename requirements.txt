@@ -12,5 +12,6 @@ plotly
 jupyter
 ipykernel
 
-# Advanced data manipulation
-datatable
+# LangChain and LangGraph for AI/LLM workflows
+langchain
+langgraph
