@@ -1,0 +1,29 @@
+{
+  "name": "Python Jupyter Dev",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "remoteUser": "vscode",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.terminal.activateEnvironment": false,
+        "jupyter.notebookFileRoot": "${workspaceFolder}"
+      }
+    }
+  },
+  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && pip install ipykernel && python -m ipykernel install --user --name devcontainer-py311 --display-name 'Python (devcontainer)'",
+  "forwardPorts": [8888],
+  "portsAttributes": {
+    "8888": {
+      "label": "Jupyter Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "mounts": [
+    "type=volume,source=pip-cache,target=/home/vscode/.cache/pip"
+  ]
+}
