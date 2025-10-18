@@ -15,3 +15,6 @@ ipykernel
 # LangChain and LangGraph for AI/LLM workflows
 langchain
 langgraph
+
+openpyxl
+anthropic

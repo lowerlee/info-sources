@@ -6,13 +6,13 @@ WORKDIR /workspace
 # Copy requirements file
 COPY requirements.txt .
 
-# Install Python packages
+# Install Python packages as root
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
     && pip install ipykernel
 
-# Create custom Jupyter kernel
-RUN python -m ipykernel install --user --name profit-status-kernel --display-name 'Profit Status Python'
-
-# Switch back to vscode user
+# Switch to vscode user BEFORE creating the kernel
 USER vscode
+
+# Create custom Jupyter kernel as vscode user
+RUN python -m ipykernel install --user --name profit-status-kernel --display-name 'Profit Status Python'
