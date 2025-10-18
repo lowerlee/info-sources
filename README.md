@@ -1,13 +1,23 @@
-# Profit Status
+# Information Sources Database
 
 ## Project Description
 
-Profit Status is a research tool that maps the organizational landscape of information sources to promote media literacy and informed consumption of news and analysis. In an era where understanding potential biases and motivations behind information sources is crucial, this project provides transparency into whether organizations are driven by profit, public service, or governmental mandates.
+This project curates and maintains a comprehensive database of information sources with enriched metadata for downstream analysis. The database includes news outlets, research institutions, government agencies, think tanks, and other information sources, with automated classification of organizational characteristics such as profit status.
 
-The project maintains a curated database of 300+ influential information sources including major news outlets, think tanks, research institutions, fact-checking organizations, and government agencies. Each source is classified by its organizational structure (for-profit, non-profit, government, or unknown) and categorized by subject matter expertise.
+The goal is to create a structured, searchable repository that enables researchers, journalists, and analysts to:
+- Understand the landscape of information sources across different topics
+- Analyze patterns in source types, organizational structures, and funding models
+- Support media literacy and source credibility assessment
+- Enable data-driven research on information ecosystems
 
-This tool serves researchers, journalists, educators, and citizens who need to quickly assess the institutional background of information sources when evaluating credibility, understanding potential conflicts of interest, or ensuring diverse perspectives in their research and reporting.
+## Todo
 
-## Problem
+- Develop automated method of annotating non-profit/for-profit status.
 
-- There's over 300+ sources that I can't manually annotate the profit status for.
+## Use Cases
+
+- **Media Research**: Analyze source diversity in news coverage
+- **Academic Studies**: Research information ecosystem structures
+- **Fact-Checking**: Cross-reference source credibility indicators  
+- **Policy Analysis**: Map influence of different organization types
+- **Journalism**: Source discovery and verification workflows
