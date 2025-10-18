@@ -1,6 +1,9 @@
 {
   "name": "Python Jupyter Dev",
-  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
   "remoteUser": "vscode",
   "customizations": {
     "vscode": {
@@ -15,7 +18,6 @@
       }
     }
   },
-  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && pip install ipykernel && python -m ipykernel install --user --name devcontainer-py311 --display-name 'Python (devcontainer)'",
   "forwardPorts": [8888],
   "portsAttributes": {
     "8888": {
