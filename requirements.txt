@@ -18,3 +18,9 @@ langgraph
 
 openpyxl
 anthropic
+
+beautifulsoup4
+lxml
+html5lib
+readability-lxml
+html2text
