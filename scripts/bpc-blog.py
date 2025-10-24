@@ -83,7 +83,7 @@ def get_all_blog_posts():
 
 articles = get_all_blog_posts()
 
-keys = ['title', 'date', 'permalink', 'type', 'tags', 'policy_areas', 'related_people', 'content']
+keys = ['title', 'date', 'permalink', 'type', 'tags', 'policy_areas', 'related_people']
 
 filtered_articles = [
     {key: article[key] for key in keys if key in article}
