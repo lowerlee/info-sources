@@ -7,6 +7,7 @@ import os
 import time
 from urllib.parse import urlparse
 import re
+import hashlib
 
 def get_full_article(html_string):
     """
@@ -51,6 +52,11 @@ def fetch_article_content(url, timeout=30):
         print(f"Error fetching {url}: {e}")
         return None
 
+def generate_id(url):
+    # Hash the URL to get consistent ID
+    hash_obj = hashlib.sha256(url.encode('utf-8'))
+    return hash_obj.hexdigest()[:12]  # First 12 chars
+
 def process_articles():
     """Process all articles from JSON and save as markdown"""
     
@@ -77,6 +83,8 @@ def process_articles():
         title = article.get('title', 'Untitled')
         date = article.get('date', '')
         url = article.get('permalink', '')
+        url_title = url.rstrip('/').split('/')[-1]
+        output_name = url_title + "_" + date
         
         if not url:
             print(f"Skipping article {i+1}: No URL found")
@@ -107,18 +115,22 @@ related_people: {json.dumps(article.get('related_people', []))}
 ---
 
 """
-            
+            hash_id = generate_id(url)
+            filename = f"{hash_id}.md"
+
+            # Add hash_id to the current article
+            article['hash_id'] = hash_id
+
             full_markdown = frontmatter + markdown_content
             
             # Save to file
-            filename = f"{sanitize_filename(title)}.md"
             filepath = os.path.join(output_dir, filename)
             
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(full_markdown)
             
             successful += 1
-            print(f"  ✓ Saved: {filename}")
+            print(f"  ✓ Saved: {url_title}")
             
         except Exception as e:
             print(f"  ✗ Error processing article: {e}")
@@ -127,7 +139,13 @@ related_people: {json.dumps(article.get('related_people', []))}
         # Rate limiting
         time.sleep(0.5)
     
+    # Save the updated articles with hash IDs back to the JSON file
+    print("\nSaving updated JSON with hash IDs...")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(articles, f, indent=2, ensure_ascii=False)
+    
     print(f"\nCompleted: {successful} successful, {failed} failed")
+    print(f"Updated JSON file saved to: {json_path}")
 
 if __name__ == "__main__":
     process_articles()

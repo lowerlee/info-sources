@@ -12,4 +12,7 @@ plotly
 beautifulsoup4
 requests
 html2text
-python-readability
+# python-readability
+readability-lxml
+
+python-frontmatter
