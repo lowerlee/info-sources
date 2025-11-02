@@ -15,3 +15,5 @@ html2text
 readability-lxml
 
 python-frontmatter
+
+bertopic
