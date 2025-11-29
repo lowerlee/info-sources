@@ -16,4 +16,14 @@ readability-lxml
 
 python-frontmatter
 
+# BERTopic
 bertopic
+nbformat>=4.2.0
+sentence_transformers
+# umap
+datamapplot
+
+# Google client libraries
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
