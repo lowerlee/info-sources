@@ -23,6 +23,8 @@ sentence_transformers
 # umap
 datamapplot
 
+anthropic
+
 # Google client libraries
 google-api-python-client
 google-auth-httplib2
