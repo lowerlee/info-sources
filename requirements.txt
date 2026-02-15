@@ -24,6 +24,7 @@ sentence_transformers
 datamapplot
 
 anthropic
+google-genai
 
 # Google client libraries
 google-api-python-client
