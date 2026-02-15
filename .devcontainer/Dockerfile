@@ -15,4 +15,4 @@ RUN pip install --upgrade pip \
 USER vscode
 
 # Create custom Jupyter kernel as vscode user
-RUN python -m ipykernel install --user --name profit-status-kernel --display-name 'Profit Status Python'
+RUN python -m ipykernel install --user --name profit-status-kernel --display-name 'Info Source'
