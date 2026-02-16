@@ -25,23 +25,28 @@ How it works:
 
 import time
 import requests
+import json
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google import genai
 import re
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 # Configuration
 SERVICE_ACCOUNT_FILE = "/workspaces/info-sources/credentials.json"
 SPREADSHEET_ID = "1NywRL9IBR69R0eSrOE9T6mVUbfJHwaALL0vp2K0TLbY"
-SHEET_RANGE = "main!A:I"
+SHEET_RANGE = "main!A:M"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # MBFC Configuration
 MBFC_BASE_URL = "https://mediabiasfactcheck.com/"
 DELAY_BETWEEN_REQUESTS = 2.0  # seconds
+
+# AI Configuration
+gemini_client = None  # Will be initialized with API key
 
 
 def extract_domain(url: str) -> str:
@@ -203,12 +208,17 @@ def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
                 page_title = extract_mbfc_page_title(response.text)
                 
                 if page_title:
-                    # Check if the page title matches the source name we're searching for
-                    if names_match(source_name, page_title):
-                        return mbfc_url
+                    # Use AI validation if available, otherwise fall back to string matching
+                    if gemini_client:
+                        if ai_validate_match(source_name, source_url, page_title, mbfc_url):
+                            return mbfc_url
                     else:
-                        # Log the mismatch for debugging
-                        print(f"   ⚠️  Found MBFC page but name mismatch: '{source_name}' vs '{page_title}'")
+                        # Check if the page title matches the source name we're searching for
+                        if names_match(source_name, page_title):
+                            return mbfc_url
+                        else:
+                            # Log the mismatch for debugging
+                            print(f"   ⚠️  Found MBFC page but name mismatch: '{source_name}' vs '{page_title}'")
                 else:
                     # If we can't extract the title, be conservative and skip
                     print(f"   ⚠️  Found MBFC page but couldn't extract title for validation")
@@ -335,9 +345,204 @@ def extract_mbfc_data(mbfc_url: str) -> Tuple[Optional[str], Optional[str], Opti
         return None, None, None
 
 
+def ai_find_mbfc_listing(source_name: str, source_url: str) -> Optional[dict]:
+    """
+    Use AI to determine if MBFC has a listing for this source and what name they use.
+    
+    Args:
+        source_name: Name of the source
+        source_url: URL of the source
+        
+    Returns:
+        Dictionary with 'has_listing', 'mbfc_name', 'confidence', 'reasoning' or None if error
+    """
+    if not gemini_client:
+        return None
+    
+    try:
+        # Extract domain for additional context
+        domain = extract_domain(source_url)
+        
+        prompt = f"""You are an expert on Media Bias Fact Check (MBFC), a website that rates news sources for bias and factual accuracy.
+
+Given this news/information source:
+Name: "{source_name}"
+URL: {source_url}
+Domain: {domain}
+
+Task: Determine if MBFC has a rating page for this source.
+
+Considerations:
+- MBFC primarily covers news outlets, think tanks, and media organizations
+- They may list organizations under official names, common names, or acronyms
+- Examples:
+  * "Unite America" (uniteamerica.org) - NOT listed (don't confuse with "Unite America First")
+  * "OCCRP" - Listed as "Organized Crime and Corruption Reporting Project"
+  * "Crisis Group" - Listed as "International Crisis Group"
+  * "ProPublica" - Listed as "ProPublica"
+- MBFC typically does NOT cover:
+  * Government agencies (CIA, FBI, State Department, etc.)
+  * Academic journals or individual researchers
+  * Corporate websites or tech companies
+  * Social media platforms
+  * Small local blogs without significant reach
+
+Based on your knowledge of MBFC:
+1. Does MBFC likely have a listing for this source?
+2. If yes, what exact name does MBFC use? (This will be used to construct the URL)
+3. What is your confidence level?
+
+Respond ONLY with valid JSON, no other text:
+{{
+  "has_listing": true or false,
+  "mbfc_name": "exact name MBFC uses" or null,
+  "confidence": "high", "medium", or "low",
+  "reasoning": "brief explanation why you think MBFC does/doesn't have this"
+}}
+
+DO NOT use markdown code blocks."""
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt
+        )
+        
+        response_text = response.text.strip()
+        response_text = response_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(response_text)
+        
+        return result
+        
+    except Exception as e:
+        print(f"   ⚠️  AI MBFC lookup failed: {str(e)}")
+        return None
+
+
+def ai_validate_match(source_name: str, source_url: str, mbfc_page_title: str, mbfc_url: str) -> bool:
+    """
+    Use AI to determine if an MBFC page matches the source we're looking for.
+    More intelligent than simple string matching.
+    
+    Args:
+        source_name: Name we're searching for
+        source_url: URL of the source
+        mbfc_page_title: Title found on MBFC page
+        mbfc_url: URL of the MBFC page
+        
+    Returns:
+        True if AI determines this is a match, False otherwise
+    """
+    if not gemini_client:
+        return names_match(source_name, mbfc_page_title)  # Fallback to original logic
+    
+    try:
+        prompt = f"""Determine if these refer to the SAME organization:
+
+Source A:
+- Name: "{source_name}"
+- URL: {source_url}
+
+Source B (from Media Bias Fact Check):
+- Name: "{mbfc_page_title}"
+- MBFC URL: {mbfc_url}
+
+Consider:
+- Organizations often have official names, common names, and acronyms
+- Parent organizations vs subsidiaries (these are DIFFERENT)
+- Similar names that are actually different organizations (be careful!)
+- "Unite America" vs "Unite America First" = DIFFERENT organizations
+- "Crisis Group" vs "International Crisis Group" = SAME organization
+- Acronyms like "OCCRP" matching "Organized Crime and Corruption Reporting Project"
+
+Respond with ONLY a JSON object, no other text:
+{{
+  "is_match": true or false,
+  "confidence": "high", "medium", or "low",
+  "reasoning": "brief explanation"
+}}
+
+DO NOT use markdown code blocks."""
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt
+        )
+        
+        response_text = response.text.strip()
+        response_text = response_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(response_text)
+        
+        is_match = result.get('is_match', False)
+        confidence = result.get('confidence', 'unknown')
+        reasoning = result.get('reasoning', '')
+        
+        if confidence == 'high' or (confidence == 'medium' and is_match):
+            if is_match:
+                print(f"   ✅ AI validated match ({confidence} confidence): {reasoning}")
+            else:
+                print(f"   ❌ AI rejected match ({confidence} confidence): {reasoning}")
+            return is_match
+        elif confidence == 'low':
+            print(f"   ⚠️  AI uncertain ({confidence} confidence): {reasoning}, falling back to string matching")
+            return names_match(source_name, mbfc_page_title)
+        
+        return is_match
+        
+    except Exception as e:
+        print(f"   ⚠️  AI validation failed: {str(e)}, falling back to string matching")
+        return names_match(source_name, mbfc_page_title)
+
+
+def search_mbfc_with_ai(source_name: str, source_url: str) -> Optional[str]:
+    """
+    Enhanced MBFC search that uses AI to determine if MBFC has the source.
+    First tries direct search, then asks AI if MBFC has it and under what name.
+    
+    Args:
+        source_name: Name of the source
+        source_url: URL of the source
+        
+    Returns:
+        MBFC page URL if found and validated, None otherwise
+    """
+    # Try direct search first with the original name
+    mbfc_url = search_mbfc(source_name, source_url)
+    if mbfc_url:
+        return mbfc_url
+    
+    # If direct search failed and AI is available, ask if MBFC has this source
+    if gemini_client:
+        print(f"   🤖 Asking AI if MBFC has a listing for this source...")
+        ai_result = ai_find_mbfc_listing(source_name, source_url)
+        
+        if ai_result:
+            has_listing = ai_result.get('has_listing', False)
+            mbfc_name = ai_result.get('mbfc_name')
+            confidence = ai_result.get('confidence', 'unknown')
+            reasoning = ai_result.get('reasoning', '')
+            
+            print(f"   💭 AI assessment ({confidence} confidence): {reasoning}")
+            
+            # Only search if AI thinks MBFC has it and provides a name
+            if has_listing and mbfc_name:
+                print(f"   🔍 Searching for: {mbfc_name}")
+                mbfc_url = search_mbfc(mbfc_name, source_url)
+                if mbfc_url:
+                    return mbfc_url
+                else:
+                    print(f"   ⚠️  AI suggested '{mbfc_name}' but search failed")
+            elif not has_listing:
+                print(f"   ℹ️  AI believes MBFC does not have this source")
+            else:
+                print(f"   ⚠️  AI thinks MBFC has it but couldn't provide a name")
+    
+    return None
+
+
 def get_mbfc_ratings(source_name: str, source_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Combine search and extraction to get MBFC ratings for a source.
+    Uses AI-enhanced search for better name matching.
     
     Args:
         source_name: Name of the source
@@ -346,7 +551,7 @@ def get_mbfc_ratings(source_name: str, source_url: str) -> Tuple[Optional[str], 
     Returns:
         Tuple of (bias_rating, factual_rating, credibility_rating)
     """
-    mbfc_url = search_mbfc(source_name, source_url)
+    mbfc_url = search_mbfc_with_ai(source_name, source_url)
     if mbfc_url:
         return extract_mbfc_data(mbfc_url)
     return None, None, None
@@ -461,6 +666,23 @@ def process_mbfc_enrichment():
     """
     Main workflow function that processes all sources and enriches them with MBFC data.
     """
+    global gemini_client
+    
+    # Get API key for AI-enhanced matching
+    api_key = input("🔑 Enter your Gemini API key (or press Enter to skip AI features): ").strip()
+    
+    if api_key:
+        try:
+            gemini_client = genai.Client(api_key=api_key)
+            print("✅ AI-enhanced matching enabled")
+        except Exception as e:
+            print(f"⚠️  Could not initialize AI client: {e}")
+            print("⚠️  Continuing with basic string matching only")
+            gemini_client = None
+    else:
+        print("ℹ️  Skipping AI features, using basic string matching only")
+        gemini_client = None
+    
     try:
         # Load sheet data
         sheets_service, headers, data_rows = load_sheet_data()
