@@ -10,17 +10,18 @@ Purpose:
 
 Requirements:
     - Credentials: credentials.json file in the root directory (Google service account)
-    - Dependencies: beautifulsoup4, requests, google-api-python-client
+    - Dependencies: beautifulsoup4, requests, google-api-python-client, googlesearch-python
     - Sheet Columns: The sheet must have mbfc_bias, mbfc_factual, and 
                      mbfc_credibility_rating columns
 
 How it works:
     1. Connects to Google Sheets and loads source data
     2. For each source without MBFC data:
-       - Searches for the source on mediabiasfactcheck.com
+       - Uses Google Search to find the source's MBFC page
+       - Validates the result matches the source (via AI or string matching)
        - Extracts bias rating, factual reporting rating, and credibility rating
        - Updates the Google Sheet with the findings
-    3. Applies rate limiting to avoid overwhelming MBFC servers
+    3. Applies rate limiting to avoid overwhelming MBFC and Google servers
 """
 
 import time
@@ -35,6 +36,10 @@ from google import genai
 import re
 from typing import Optional, Tuple, List
 
+# Import googlesearch for Google-based MBFC lookups
+# Install with: pip install googlesearch-python
+from googlesearch import search as google_search
+
 # Configuration
 SERVICE_ACCOUNT_FILE = "/workspaces/info-sources/credentials.json"
 SPREADSHEET_ID = "1NywRL9IBR69R0eSrOE9T6mVUbfJHwaALL0vp2K0TLbY"
@@ -43,7 +48,8 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # MBFC Configuration
 MBFC_BASE_URL = "https://mediabiasfactcheck.com/"
-DELAY_BETWEEN_REQUESTS = 2.0  # seconds
+DELAY_BETWEEN_REQUESTS = 2.0  # seconds between MBFC page fetches
+DELAY_BETWEEN_SEARCHES = 3.0  # seconds between Google searches (to avoid rate limiting)
 
 # AI Configuration
 gemini_client = None  # Will be initialized with API key
@@ -169,62 +175,170 @@ def names_match(search_name: str, page_name: str, threshold: float = 0.7) -> boo
     return False
 
 
-def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
+def is_valid_mbfc_source_url(url: str) -> bool:
     """
-    Search for source on MBFC by trying different URL patterns.
-    Validates that the found page actually matches the searched source.
+    Check if a URL is an actual MBFC source review page (not a category page,
+    about page, methodology page, etc.).
+    
+    Principle: MBFC has many structural pages that appear in Google results but
+    don't contain ratings for a specific source. This function filters those out
+    by checking for known non-source URL patterns.
     
     Args:
-        source_name: Name of the source
-        source_url: URL of the source
+        url: URL string to validate
+        
+    Returns:
+        True if the URL appears to be an MBFC source page, False otherwise
+    """
+    # Must be on the MBFC domain
+    if 'mediabiasfactcheck.com' not in url:
+        return False
+    
+    # These are MBFC structural/category pages, not individual source reviews.
+    # Each pattern represents a URL path segment that indicates a non-source page.
+    excluded_patterns = [
+        '/category/',       # Category listing pages (e.g., /category/left-center/)
+        '/about/',          # About MBFC pages
+        '/methodology/',    # Their methodology explanation
+        '/frequently-asked-questions/',  # FAQ page
+        '/tag/',            # Tag listing pages
+        '/author/',         # Author pages
+        '/page/',           # Paginated listing pages
+        '/wp-content/',     # WordPress media/assets
+        '/wp-admin/',       # WordPress admin
+        '/contact/',        # Contact page
+        '/search/',         # Search results page
+    ]
+    
+    # Return False if the URL contains any excluded pattern
+    for pattern in excluded_patterns:
+        if pattern in url.lower():
+            return False
+    
+    return True
+
+
+def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
+    """
+    Search for a source on MBFC using Google Search.
+    
+    This replaces the old slug-guessing approach. Instead of constructing URLs like
+    mediabiasfactcheck.com/{slugified-name}/ and hoping they exist, this function
+    queries Google to find the actual MBFC page.
+    
+    Why plain queries instead of site: operator:
+    - The googlesearch-python library often returns zero results with site: queries
+      (likely due to how it scrapes Google's HTML response)
+    - A plain query like "ACLED MBFC mediabiasfactcheck" finds the page immediately
+      (as confirmed by manual browser testing), then we filter to MBFC URLs
+    - Google handles fuzzy matching, acronyms, alternate names, and special characters
+    
+    Steps:
+    1. Query Google: "{source_name} MBFC mediabiasfactcheck"
+    2. Filter results to only mediabiasfactcheck.com source review pages
+    3. Fetch each candidate page and check it contains "Bias Rating:"
+    4. Validate the page title matches our source (via AI or string matching)
+    5. If name-based search fails, try again with the domain name as fallback
+    
+    Args:
+        source_name: Name of the source (e.g., "Armed Conflict Location & Event Data Project")
+        source_url: URL of the source (e.g., "https://acleddata.com/")
         
     Returns:
         MBFC page URL if found and validated, None otherwise
     """
-    # Convert source name to slug format (lowercase, replace spaces with hyphens)
-    name_slug = source_name.lower().strip()
-    name_slug = re.sub(r'[^a-z0-9\s-]', '', name_slug)
-    name_slug = re.sub(r'\s+', '-', name_slug)
-    name_slug = re.sub(r'-+', '-', name_slug)
+    # Build a list of Google search queries to try, in priority order.
+    #
+    # NOTE: We intentionally avoid the site: operator here. While site: works in a
+    # browser, the googlesearch-python library often returns zero results with it
+    # (likely due to how it scrapes Google's HTML). Instead, we append "MBFC
+    # mediabiasfactcheck" to the query, which naturally surfaces MBFC pages as the
+    # top results — exactly what a human would search. We then filter the results
+    # to only mediabiasfactcheck.com URLs using is_valid_mbfc_source_url().
+    search_queries = []
     
-    # Extract domain from URL
+    # Primary query: source name + MBFC keywords.
+    # e.g., "Armed Conflict Location & Event Data Project MBFC mediabiasfactcheck"
+    # Google's fuzzy matching handles special characters (&, parentheses) gracefully.
+    search_queries.append(f"{source_name} MBFC mediabiasfactcheck")
+    
+    # Secondary query: domain name + MBFC keywords as a fallback.
+    # Useful when the source name in our sheet differs from what MBFC uses,
+    # but the domain is recognizable (e.g., "acleddata" from acleddata.com)
     domain = extract_domain(source_url)
-    domain_slug = domain.replace('.', '-') if domain else ""
+    if domain:
+        # Remove TLD (.com, .org, etc.) to get a cleaner search term
+        # e.g., "acleddata.com" → "acleddata"
+        domain_name = domain.rsplit('.', 1)[0] if '.' in domain else domain
+        domain_query = f"{domain_name} MBFC mediabiasfactcheck"
+        # Only add if it's meaningfully different from the name-based query
+        if domain_query != search_queries[0]:
+            search_queries.append(domain_query)
     
-    # Try different URL patterns
-    patterns_to_try = []
-    if name_slug:
-        patterns_to_try.append(name_slug)
-    if domain_slug and domain_slug != name_slug:
-        patterns_to_try.append(domain_slug)
-    
-    for pattern in patterns_to_try:
+    for query in search_queries:
         try:
-            mbfc_url = f"{MBFC_BASE_URL}{pattern}/"
-            response = requests.get(mbfc_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            print(f"   🔎 Google: \"{query}\"")
             
-            if response.status_code == 200 and 'Bias Rating:' in response.text:
-                # Extract the page title/name to validate it matches
-                page_title = extract_mbfc_page_title(response.text)
-                
-                if page_title:
-                    # Use AI validation if available, otherwise fall back to string matching
-                    if gemini_client:
-                        if ai_validate_match(source_name, source_url, page_title, mbfc_url):
-                            return mbfc_url
-                    else:
-                        # Check if the page title matches the source name we're searching for
-                        if names_match(source_name, page_title):
-                            return mbfc_url
-                        else:
-                            # Log the mismatch for debugging
-                            print(f"   ⚠️  Found MBFC page but name mismatch: '{source_name}' vs '{page_title}'")
-                else:
-                    # If we can't extract the title, be conservative and skip
-                    print(f"   ⚠️  Found MBFC page but couldn't extract title for validation")
+            # Perform the Google search.
+            # num_results=5: fetch top 5 results — balances coverage vs. speed/rate-limits
+            # lang='en': MBFC is English-language, so restrict to English results
+            results = list(google_search(query, num_results=5, lang='en'))
+            
+            # Filter to only valid MBFC source review pages.
+            # This removes category pages (/category/left/), about pages, etc.
+            mbfc_results = [url for url in results if is_valid_mbfc_source_url(url)]
+            
+            if not mbfc_results:
+                print(f"   ⚠️  No valid MBFC source pages in results")
+                # Pause before trying the next query to respect Google rate limits
+                time.sleep(DELAY_BETWEEN_SEARCHES)
+                continue
+            
+            print(f"   📋 Found {len(mbfc_results)} candidate page(s)")
+            
+            # Try each candidate — fetch the page and validate the title matches our source
+            for candidate_url in mbfc_results:
+                try:
+                    # Fetch the candidate MBFC page
+                    response = requests.get(
+                        candidate_url,
+                        timeout=10,
+                        headers={'User-Agent': 'Mozilla/5.0'}
+                    )
                     
-        except Exception:
+                    # Verify: page loaded AND contains "Bias Rating:" (confirms it's a real review)
+                    if response.status_code == 200 and 'Bias Rating:' in response.text:
+                        # Extract the page title to validate it matches our source
+                        page_title = extract_mbfc_page_title(response.text)
+                        
+                        if page_title:
+                            # Use AI validation if available (handles acronyms, alternate names, etc.)
+                            # Otherwise fall back to string-based matching
+                            if gemini_client:
+                                if ai_validate_match(source_name, source_url, page_title, candidate_url):
+                                    return candidate_url
+                            else:
+                                if names_match(source_name, page_title):
+                                    print(f"   ✅ Matched: \"{page_title}\" → {candidate_url}")
+                                    return candidate_url
+                                else:
+                                    print(f"   ⚠️  Name mismatch: '{source_name}' vs '{page_title}'")
+                        else:
+                            print(f"   ⚠️  Couldn't extract title from {candidate_url}")
+                    
+                    # Small delay between fetching candidate pages
+                    time.sleep(DELAY_BETWEEN_REQUESTS)
+                    
+                except Exception as e:
+                    print(f"   ⚠️  Error fetching {candidate_url}: {str(e)}")
+                    continue
+            
+        except Exception as e:
+            print(f"   ⚠️  Google search error: {str(e)}")
             continue
+        
+        # Delay between different Google search queries to avoid rate limiting
+        time.sleep(DELAY_BETWEEN_SEARCHES)
     
     return None
 
@@ -495,8 +609,18 @@ DO NOT use markdown code blocks."""
 
 def search_mbfc_with_ai(source_name: str, source_url: str) -> Optional[str]:
     """
-    Enhanced MBFC search that uses AI to determine if MBFC has the source.
-    First tries direct search, then asks AI if MBFC has it and under what name.
+    Enhanced MBFC search that combines Google Search with AI assistance.
+    
+    The search proceeds in two phases:
+    
+    Phase 1 — Google Search with the original source name.
+      Queries Google for "site:mediabiasfactcheck.com {source_name}" and validates
+      results. This catches most sources directly.
+    
+    Phase 2 — AI-assisted retry (only if Phase 1 fails and Gemini is available).
+      Asks Gemini what name MBFC uses for this source, then runs a second Google
+      Search with that AI-suggested name. This handles cases where our spreadsheet
+      name differs significantly from MBFC's listing name.
     
     Args:
         source_name: Name of the source
@@ -505,12 +629,12 @@ def search_mbfc_with_ai(source_name: str, source_url: str) -> Optional[str]:
     Returns:
         MBFC page URL if found and validated, None otherwise
     """
-    # Try direct search first with the original name
+    # Phase 1: Google Search with the original source name
     mbfc_url = search_mbfc(source_name, source_url)
     if mbfc_url:
         return mbfc_url
     
-    # If direct search failed and AI is available, ask if MBFC has this source
+    # Phase 2: If direct search failed and AI is available, ask what name MBFC uses
     if gemini_client:
         print(f"   🤖 Asking AI if MBFC has a listing for this source...")
         ai_result = ai_find_mbfc_listing(source_name, source_url)
@@ -523,18 +647,18 @@ def search_mbfc_with_ai(source_name: str, source_url: str) -> Optional[str]:
             
             print(f"   💭 AI assessment ({confidence} confidence): {reasoning}")
             
-            # Only search if AI thinks MBFC has it and provides a name
-            if has_listing and mbfc_name:
-                print(f"   🔍 Searching for: {mbfc_name}")
+            # Only retry if AI thinks MBFC has it AND provides a different name to try
+            if has_listing and mbfc_name and mbfc_name != source_name:
+                print(f"   🔍 Retrying Google Search with AI-suggested name: \"{mbfc_name}\"")
                 mbfc_url = search_mbfc(mbfc_name, source_url)
                 if mbfc_url:
                     return mbfc_url
                 else:
-                    print(f"   ⚠️  AI suggested '{mbfc_name}' but search failed")
+                    print(f"   ⚠️  AI suggested '{mbfc_name}' but Google Search still found nothing")
             elif not has_listing:
                 print(f"   ℹ️  AI believes MBFC does not have this source")
             else:
-                print(f"   ⚠️  AI thinks MBFC has it but couldn't provide a name")
+                print(f"   ⚠️  AI thinks MBFC has it but couldn't provide a useful alternate name")
     
     return None
 
