@@ -10,35 +10,31 @@ Purpose:
 
 Requirements:
     - Credentials: credentials.json file in the root directory (Google service account)
-    - Dependencies: beautifulsoup4, requests, google-api-python-client, googlesearch-python
+    - Dependencies: beautifulsoup4, requests, google-api-python-client
     - Sheet Columns: The sheet must have mbfc_bias, mbfc_factual, and 
                      mbfc_credibility_rating columns
 
 How it works:
     1. Connects to Google Sheets and loads source data
     2. For each source without MBFC data:
-       - Uses Google Search to find the source's MBFC page
+       - Uses MBFC's built-in WordPress search to find the source's page
        - Validates the result matches the source (via AI or string matching)
        - Extracts bias rating, factual reporting rating, and credibility rating
        - Updates the Google Sheet with the findings
-    3. Applies rate limiting to avoid overwhelming MBFC and Google servers
+    3. Applies rate limiting to avoid overwhelming MBFC servers
 """
 
 import time
 import requests
 import json
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google import genai
 import re
 from typing import Optional, Tuple, List
-
-# Import googlesearch for Google-based MBFC lookups
-# Install with: pip install googlesearch-python
-from googlesearch import search as google_search
 
 # Configuration
 SERVICE_ACCOUNT_FILE = "/workspaces/info-sources/credentials.json"
@@ -48,8 +44,8 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # MBFC Configuration
 MBFC_BASE_URL = "https://mediabiasfactcheck.com/"
+MBFC_SEARCH_URL = "https://mediabiasfactcheck.com/?s="  # WordPress built-in search endpoint
 DELAY_BETWEEN_REQUESTS = 2.0  # seconds between MBFC page fetches
-DELAY_BETWEEN_SEARCHES = 3.0  # seconds between Google searches (to avoid rate limiting)
 
 # AI Configuration
 gemini_client = None  # Will be initialized with API key
@@ -218,27 +214,83 @@ def is_valid_mbfc_source_url(url: str) -> bool:
     return True
 
 
+def parse_mbfc_search_results(html_content: str) -> List[str]:
+    """
+    Parse the MBFC WordPress search results page and extract article URLs.
+    
+    MBFC is a WordPress site. When you visit https://mediabiasfactcheck.com/?s=ACLED,
+    WordPress returns an HTML page containing search results. Each result is an
+    <article> element with an <a> link to the source review page.
+    
+    Args:
+        html_content: Raw HTML of the MBFC search results page
+        
+    Returns:
+        List of URLs found in the search results, filtered to valid source pages
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    urls = []
+    
+    # WordPress search results are typically wrapped in <article> tags.
+    # Each article contains an <a> with the link to the full page.
+    articles = soup.find_all('article')
+    for article in articles:
+        # Find the first <a> tag with an href inside each article
+        link = article.find('a', href=True)
+        if link:
+            href = link['href']
+            # Only keep URLs that point to actual MBFC source review pages
+            # (filters out category pages, about pages, etc.)
+            if is_valid_mbfc_source_url(href):
+                urls.append(href)
+    
+    # Fallback: if no <article> tags found (some themes differ), try finding
+    # links inside common WordPress search result containers
+    if not urls:
+        # Look for links inside common result wrapper classes
+        for container_class in ['search-results', 'entry-title', 'post-title']:
+            for element in soup.find_all(class_=container_class):
+                link = element.find('a', href=True)
+                if link and is_valid_mbfc_source_url(link['href']):
+                    urls.append(link['href'])
+    
+    # Final fallback: scan all links on the page for MBFC source URLs
+    # This is broader but catches results even if the HTML structure is unexpected
+    if not urls:
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if is_valid_mbfc_source_url(href) and href != MBFC_BASE_URL:
+                # Avoid duplicates
+                if href not in urls:
+                    urls.append(href)
+    
+    return urls
+
+
 def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
     """
-    Search for a source on MBFC using Google Search.
+    Search for a source on MBFC using MBFC's own built-in WordPress search.
     
-    This replaces the old slug-guessing approach. Instead of constructing URLs like
-    mediabiasfactcheck.com/{slugified-name}/ and hoping they exist, this function
-    queries Google to find the actual MBFC page.
+    Previous approaches failed because:
+    - Slug guessing: breaks on special characters (&, parentheses, acronyms)
+    - googlesearch-python: unreliable, returns empty results due to scraping limitations
     
-    Why plain queries instead of site: operator:
-    - The googlesearch-python library often returns zero results with site: queries
-      (likely due to how it scrapes Google's HTML response)
-    - A plain query like "ACLED MBFC mediabiasfactcheck" finds the page immediately
-      (as confirmed by manual browser testing), then we filter to MBFC URLs
-    - Google handles fuzzy matching, acronyms, alternate names, and special characters
+    This approach queries MBFC directly via their WordPress search endpoint:
+    https://mediabiasfactcheck.com/?s={search_term}
+    
+    Advantages:
+    - No third-party dependencies (just requests + BeautifulSoup, already used)
+    - Searches MBFC's own index, so results are always from the right site
+    - No Google rate limiting or CAPTCHA issues
+    - WordPress full-text search handles partial matches and alternate names
     
     Steps:
-    1. Query Google: "{source_name} MBFC mediabiasfactcheck"
-    2. Filter results to only mediabiasfactcheck.com source review pages
-    3. Fetch each candidate page and check it contains "Bias Rating:"
-    4. Validate the page title matches our source (via AI or string matching)
-    5. If name-based search fails, try again with the domain name as fallback
+    1. Query MBFC's search: https://mediabiasfactcheck.com/?s={source_name}
+    2. Parse the search results HTML for article links
+    3. Filter to only valid source review pages
+    4. Fetch each candidate and validate it contains "Bias Rating:"
+    5. Validate the page title matches our source (via AI or string matching)
+    6. If name-based search fails, try with the domain name, then acronym
     
     Args:
         source_name: Name of the source (e.g., "Armed Conflict Location & Event Data Project")
@@ -247,57 +299,64 @@ def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
     Returns:
         MBFC page URL if found and validated, None otherwise
     """
-    # Build a list of Google search queries to try, in priority order.
-    #
-    # NOTE: We intentionally avoid the site: operator here. While site: works in a
-    # browser, the googlesearch-python library often returns zero results with it
-    # (likely due to how it scrapes Google's HTML). Instead, we append "MBFC
-    # mediabiasfactcheck" to the query, which naturally surfaces MBFC pages as the
-    # top results — exactly what a human would search. We then filter the results
-    # to only mediabiasfactcheck.com URLs using is_valid_mbfc_source_url().
-    search_queries = []
+    # Build a list of search terms to try, in priority order.
+    search_terms = []
     
-    # Primary query: source name + MBFC keywords.
-    # e.g., "Armed Conflict Location & Event Data Project MBFC mediabiasfactcheck"
-    # Google's fuzzy matching handles special characters (&, parentheses) gracefully.
-    search_queries.append(f"{source_name} MBFC mediabiasfactcheck")
+    # Primary: the full source name as-is
+    # e.g., "Armed Conflict Location & Event Data Project"
+    search_terms.append(source_name)
     
-    # Secondary query: domain name + MBFC keywords as a fallback.
-    # Useful when the source name in our sheet differs from what MBFC uses,
-    # but the domain is recognizable (e.g., "acleddata" from acleddata.com)
+    # Secondary: if the name contains parentheses with an acronym, try the acronym alone.
+    # e.g., "Armed Conflict Location & Event Data Project (ACLED)" → "ACLED"
+    # Many MBFC pages are titled with the acronym first, so this catches those.
+    acronym_match = re.search(r'\(([A-Z]{2,})\)', source_name)
+    if acronym_match:
+        search_terms.append(acronym_match.group(1))
+    
+    # Tertiary: the domain name stripped of TLD as a fallback.
+    # e.g., "acleddata.com" → "acleddata"
+    # Useful when our spreadsheet name doesn't match MBFC's listing name at all.
     domain = extract_domain(source_url)
     if domain:
-        # Remove TLD (.com, .org, etc.) to get a cleaner search term
-        # e.g., "acleddata.com" → "acleddata"
         domain_name = domain.rsplit('.', 1)[0] if '.' in domain else domain
-        domain_query = f"{domain_name} MBFC mediabiasfactcheck"
-        # Only add if it's meaningfully different from the name-based query
-        if domain_query != search_queries[0]:
-            search_queries.append(domain_query)
+        # Only add if it's meaningfully different from what we already have
+        if domain_name.lower() not in [t.lower() for t in search_terms]:
+            search_terms.append(domain_name)
     
-    for query in search_queries:
+    for term in search_terms:
         try:
-            print(f"   🔎 Google: \"{query}\"")
+            # URL-encode the search term so special chars (&, spaces, etc.) are handled
+            encoded_term = quote_plus(term)
+            search_url = f"{MBFC_SEARCH_URL}{encoded_term}"
             
-            # Perform the Google search.
-            # num_results=5: fetch top 5 results — balances coverage vs. speed/rate-limits
-            # lang='en': MBFC is English-language, so restrict to English results
-            results = list(google_search(query, num_results=5, lang='en'))
+            print(f"   🔎 MBFC search: \"{term}\"")
             
-            # Filter to only valid MBFC source review pages.
-            # This removes category pages (/category/left/), about pages, etc.
-            mbfc_results = [url for url in results if is_valid_mbfc_source_url(url)]
+            # Fetch the MBFC search results page
+            response = requests.get(
+                search_url,
+                timeout=15,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
             
-            if not mbfc_results:
-                print(f"   ⚠️  No valid MBFC source pages in results")
-                # Pause before trying the next query to respect Google rate limits
-                time.sleep(DELAY_BETWEEN_SEARCHES)
+            if response.status_code != 200:
+                print(f"   ⚠️  MBFC search returned status {response.status_code}")
+                time.sleep(DELAY_BETWEEN_REQUESTS)
                 continue
             
-            print(f"   📋 Found {len(mbfc_results)} candidate page(s)")
+            # Parse the search results HTML to extract article URLs
+            candidate_urls = parse_mbfc_search_results(response.text)
             
-            # Try each candidate — fetch the page and validate the title matches our source
-            for candidate_url in mbfc_results:
+            if not candidate_urls:
+                print(f"   ⚠️  No results found for \"{term}\"")
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+                continue
+            
+            # Limit to top 5 candidates to avoid excessive fetching
+            candidate_urls = candidate_urls[:5]
+            print(f"   📋 Found {len(candidate_urls)} candidate page(s)")
+            
+            # Try each candidate — fetch the page and validate the title matches
+            for candidate_url in candidate_urls:
                 try:
                     # Fetch the candidate MBFC page
                     response = requests.get(
@@ -312,7 +371,7 @@ def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
                         page_title = extract_mbfc_page_title(response.text)
                         
                         if page_title:
-                            # Use AI validation if available (handles acronyms, alternate names, etc.)
+                            # Use AI validation if available (handles acronyms, alternate names)
                             # Otherwise fall back to string-based matching
                             if gemini_client:
                                 if ai_validate_match(source_name, source_url, page_title, candidate_url):
@@ -326,7 +385,7 @@ def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
                         else:
                             print(f"   ⚠️  Couldn't extract title from {candidate_url}")
                     
-                    # Small delay between fetching candidate pages
+                    # Small delay between fetching candidate pages to be polite to MBFC
                     time.sleep(DELAY_BETWEEN_REQUESTS)
                     
                 except Exception as e:
@@ -334,11 +393,11 @@ def search_mbfc(source_name: str, source_url: str) -> Optional[str]:
                     continue
             
         except Exception as e:
-            print(f"   ⚠️  Google search error: {str(e)}")
+            print(f"   ⚠️  MBFC search error: {str(e)}")
             continue
         
-        # Delay between different Google search queries to avoid rate limiting
-        time.sleep(DELAY_BETWEEN_SEARCHES)
+        # Delay between different search queries
+        time.sleep(DELAY_BETWEEN_REQUESTS)
     
     return None
 
