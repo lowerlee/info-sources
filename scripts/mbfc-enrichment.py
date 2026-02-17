@@ -969,8 +969,19 @@ def process_mbfc_enrichment():
                 except Exception as e:
                     print(f"   ❌ Error updating sheet: {str(e)}\n")
             else:
-                not_found_count += 1
-                print(f"   ❌ Not found on MBFC\n")
+                # Source not found - write "No Data" to all columns
+                row['mbfc_bias'] = "No Data"
+                row['mbfc_factual'] = "No Data"
+                row['mbfc_credibility_rating'] = "No Data"
+                
+                try:
+                    update_sheet_row(sheets_service, row_index, headers, row)
+                    not_found_count += 1
+                    print(f"   ❌ Not found on MBFC - marked as 'No Data'")
+                    print(f"   📝 Updated sheet\n")
+                except Exception as e:
+                    print(f"   ❌ Error updating sheet: {str(e)}\n")
+                    not_found_count += 1
             
             # Apply rate limiting
             time.sleep(DELAY_BETWEEN_REQUESTS)
