@@ -372,27 +372,28 @@ def extract_adfontes_data(
     3. Bias score        — a signed float string, e.g., "17.08" or "-5.2"
     4. Reliability score — an unsigned float string, e.g., "20.47"
 
-    Labels and scores are extracted via three strategies:
+    Labels and scores are extracted via three strategies (in priority order):
 
-    Strategy A — Labels via the standardized overview sentence (plain body text):
-        Every Ad Fontes page contains a sentence following this exact template:
+    Strategy A — Labels via the standardized overview sentence:
+        Some Ad Fontes pages contain a sentence following this exact template:
         "Ad Fontes Media rates {source} in the {BIAS_LABEL} category of bias
          and as {RELIABILITY_LABEL} in terms of reliability."
         We extract both labels from it using a single regex.
 
-    Strategy B — Scores via line-by-line scan (numeric "Bias: X" lines):
+    Strategy D — Labels via elementor-widget-container parsing:
+        The info card widget is always wrapped in:
+        <div class="elementor-widget-container">
+            <p><b>Bias:</b> Middle</p>
+            <p><b>Reliability:</b> Reliable, Analysis/Fact Reporting</p>
+        </div>
+        We target this div specifically and use separator=' ' to keep
+        <b>Bias:</b> and its value on the same line, then extract with regex.
+
+    Strategy B — Scores via line-by-line scan:
         The "Overall Score" section uses plain text lines like:
             "Reliability: 44.97"
             "Bias: -1.41"
         These are parsed line-by-line as key: number pairs.
-
-    Strategy C — Labels via line-by-line scan (text "Bias: X" lines):
-        Many Ad Fontes pages (e.g., AP) only display labels in a card widget:
-            "Bias: Middle"
-            "Reliability: Reliable, Analysis/Fact Reporting"
-        These are the same "Key: Value" line format as Strategy B, but with
-        text values rather than numbers. Strategy C runs only if Strategy A
-        failed to find labels, so it never overwrites a valid Strategy A result.
 
     Args:
         adfontes_url: Full URL of the Ad Fontes source review page.
@@ -412,10 +413,7 @@ def extract_adfontes_data(
 
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Use separator='\n' to prevent adjacent inline elements from being
-        # concatenated without any whitespace between them. Without this,
-        # "<p>Bias: Skews Left</p><p>Reliability:..." becomes the single string
-        # "Skews LeftReliability:..." which corrupts the bias_label value.
+        # Use separator='\n' for full-page text extraction (used by Strategy A and B)
         page_text = soup.get_text(separator='\n')
 
         bias_label        = None
@@ -423,19 +421,15 @@ def extract_adfontes_data(
         bias_score        = None
         reliability_score = None
 
-        # -------------------------------------------------------------------
-        # Strategy A: Extract LABELS from the standardized overview sentence.
+        # ═══════════════════════════════════════════════════════════════
+        # STRATEGY A: Extract LABELS from the standardized overview sentence.
         #
-        # The sentence always follows this template (confirmed across multiple
-        # Ad Fontes pages via web search):
+        # Some (but not all) Ad Fontes pages contain this sentence:
         #   "Ad Fontes Media rates {source} in the {BIAS_LABEL} category of
         #    bias and as {RELIABILITY_LABEL} in terms of reliability."
         #
-        # re.DOTALL allows .+ to match across newlines in case the sentence
-        # wraps (unlikely but safe).
-        # The .+? (non-greedy) stops at the first occurrence of each keyword
-        # so we don't accidentally capture text beyond the label itself.
-        # -------------------------------------------------------------------
+        # This is the most reliable source when present, so we try it first.
+        # ═══════════════════════════════════════════════════════════════
         overview_match = re.search(
             r'Ad Fontes Media rates .+? in the (.+?) category of bias'
             r' and as (.+?) in terms of reliability',
@@ -443,24 +437,76 @@ def extract_adfontes_data(
             re.IGNORECASE | re.DOTALL
         )
         if overview_match:
-            # group(1) = bias label, e.g. "Middle", "Strong Right", "Skews Left"
-            # group(2) = reliability label, e.g. "Reliable, Analysis/Fact Reporting"
             bias_label        = overview_match.group(1).strip()
             reliability_label = overview_match.group(2).strip()
 
-        # -------------------------------------------------------------------
-        # Strategy B: Extract SCORES by scanning lines for numeric "Key: N"
+        # ═══════════════════════════════════════════════════════════════
+        # STRATEGY D: Extract LABELS from elementor-widget-container.
+        #
+        # Every Ad Fontes page has an info card widget wrapped in:
+        #   <div class="elementor-widget-container">
+        #       <p><b>Bias:</b> Middle</p>
+        #       <p><b>Reliability:</b> Reliable, Analysis/Fact Reporting</p>
+        #   </div>
+        #
+        # We target this div specifically to avoid false positives from
+        # boilerplate text elsewhere on the page (e.g., "unrated" in
+        # historical notes or methodology sections).
+        #
+        # Using get_text(separator=' ') keeps <b>Bias:</b> and its value
+        # together on one line: "Bias: Middle" instead of two lines.
+        # ═══════════════════════════════════════════════════════════════
+        if bias_label is None or reliability_label is None:
+            # Find ALL divs with this class (there may be multiple on the page)
+            for widget in soup.find_all('div', class_='elementor-widget-container'):
+                # Get text with space separator so <b>Bias:</b> Middle becomes "Bias: Middle"
+                widget_text = widget.get_text(separator=' ', strip=True)
+                
+                # Extract bias label
+                # [^0-9\n] ensures we don't match "Bias: 0.0" or "Bias: -1.48"
+                # (?=...) is a lookahead: stop at "Reliability:" or end of string
+                if bias_label is None:
+                    bias_match = re.search(
+                        r'Bias:\s*([^0-9\n][^\n]*?)(?=\s*Reliability:|\s*$)',
+                        widget_text,
+                        re.IGNORECASE
+                    )
+                    if bias_match:
+                        candidate = bias_match.group(1).strip()
+                        # Final validation: must not be a number
+                        if candidate and not re.match(r'^-?\d+\.?\d*$', candidate):
+                            bias_label = candidate
+                
+                # Extract reliability label
+                # Same pattern: [^0-9\n] rejects numeric scores
+                if reliability_label is None:
+                    reliability_match = re.search(
+                        r'Reliability:\s*([^0-9\n][^\n]*?)(?=\s*$)',
+                        widget_text,
+                        re.IGNORECASE
+                    )
+                    if reliability_match:
+                        candidate = reliability_match.group(1).strip()
+                        # Final validation: must not be a number
+                        if candidate and not re.match(r'^\d+\.?\d*$', candidate):
+                            reliability_label = candidate
+                
+                # Stop scanning widgets once both labels are found
+                if bias_label and reliability_label:
+                    break
+
+        # ═══════════════════════════════════════════════════════════════
+        # STRATEGY B: Extract SCORES by scanning lines for numeric "Key: N"
         # patterns in the "Overall Score" section.
         #
-        # We pre-strip lines and drop blanks so the loop is clean.
-        # We only accept values that match a float pattern, ensuring we
-        # never accidentally store a label as a score.
-        # -------------------------------------------------------------------
+        # This runs independently of label extraction because scores and
+        # labels appear in different parts of the page.
+        # ═══════════════════════════════════════════════════════════════
         lines = [line.strip() for line in page_text.split('\n') if line.strip()]
 
         for line in lines:
             # Extract bias score: "Bias: -1.41" or "Bias: 17.08"
-            # Bias scores are signed floats (negative = left of center).
+            # Bias scores are signed floats (negative = left of center)
             if bias_score is None and re.search(r'\bBias\s*:', line, re.IGNORECASE):
                 parts = line.split(':', 1)
                 value = parts[1].strip() if len(parts) > 1 else ""
@@ -468,65 +514,16 @@ def extract_adfontes_data(
                     bias_score = value
 
             # Extract reliability score: "Reliability: 44.97"
-            # Reliability scores are always positive floats (0–64 scale).
+            # Reliability scores are always positive floats (0–64 scale)
             elif reliability_score is None and re.search(r'\bReliability\s*:', line, re.IGNORECASE):
                 parts = line.split(':', 1)
                 value = parts[1].strip() if len(parts) > 1 else ""
                 if re.match(r'^\d+\.?\d*$', value):
                     reliability_score = value
 
-            # Stop early once we have both scores — no need to scan the rest
+            # Stop early once we have both scores
             if bias_score and reliability_score:
                 break
-
- # -------------------------------------------------------------------
-        # Strategy C: Extract LABELS from "Key: Value" card lines, with a
-        # next-line fallback for split HTML rendering.
-        #
-        # The AP page (and others) renders labels via inline HTML like:
-        #   <p><b>Bias:</b> Middle</p>
-        #
-        # BeautifulSoup's separator='\n' splits the <b> content onto its own
-        # line, so we get:
-        #   line i:   "Bias:"          ← from <b>Bias:</b>
-        #   line i+1: "Middle"         ← the text node that followed </b>
-        #
-        # When split(':', 1) on "Bias:" gives an empty right-hand side, we
-        # look at lines[i+1] for the value instead of discarding it.
-        # -------------------------------------------------------------------
-        if bias_label is None or reliability_label is None:
-            for i, line in enumerate(lines):
-
-                # ── Bias label ──────────────────────────────────────────────
-                if bias_label is None and re.search(r'\bBias\s*:', line, re.IGNORECASE):
-                    parts = line.split(':', 1)             # Split on first colon
-                    value = parts[1].strip() if len(parts) > 1 else ""
-
-                    # If value is empty, the text node is on the next line
-                    # (BeautifulSoup split the <b>Bias:</b> onto its own line)
-                    if not value and i + 1 < len(lines):
-                        value = lines[i + 1].strip()       # Peek at the next line
-
-                    # Accept only if non-empty and not a raw number (that's the score)
-                    if value and not re.match(r'^-?\d+\.?\d*$', value):
-                        bias_label = value
-
-                # ── Reliability label ────────────────────────────────────────
-                elif reliability_label is None and re.search(r'\bReliability\s*:', line, re.IGNORECASE):
-                    parts = line.split(':', 1)
-                    value = parts[1].strip() if len(parts) > 1 else ""
-
-                    # Same next-line fallback for split HTML rendering
-                    if not value and i + 1 < len(lines):
-                        value = lines[i + 1].strip()       # Peek at the next line
-
-                    # Accept only if non-empty and not a raw number (that's the score)
-                    if value and not re.match(r'^\d+\.?\d*$', value):
-                        reliability_label = value
-
-                # Stop once both labels are found
-                if bias_label and reliability_label:
-                    break
 
         return bias_label, reliability_label, bias_score, reliability_score
 
